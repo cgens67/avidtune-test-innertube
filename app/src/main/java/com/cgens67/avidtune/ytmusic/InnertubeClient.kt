@@ -73,7 +73,6 @@ data class PlayerClient(
 object BitChordInnertube {
     private const val MUSIC_BASE = "https://music.youtube.com/youtubei/v1"
     private const val MUSIC_ORIGIN = "https://music.youtube.com"
-    private const val YOUTUBE_ORIGIN = "https://www.youtube.com"
     private const val WEB_REMIX_VERSION = "1.20250101.01.00"
     private const val WEB_REMIX_CLIENT_ID = "67"
 
@@ -394,7 +393,7 @@ object InnertubeParser {
         return if (items.isEmpty()) null else HomeShelf(title.ifBlank { "For you" }, items)
     }
 
-    fun parseSearchPage(response: JsonObject, includeVideos: Boolean = false): YtMusicRepository.SearchPage {
+    fun parseSearchPage(response: JsonObject, includeVideos: Boolean = false): SearchPage {
         val topResults = collectRenderers(response, "musicCardShelfRenderer").mapNotNull { card ->
             parseCardShelfSong(card)?.let(SearchResult::TopTrack)
                 ?: parseCardShelfBrowse(card)?.let(SearchResult::Browse)
@@ -420,7 +419,7 @@ object InnertubeParser {
                 }
             }
         }
-        return YtMusicRepository.SearchPage(parsed, continuationToken(response))
+        return SearchPage(parsed, continuationToken(response))
     }
 
     fun parseSearchSuggestions(response: JsonObject): List<String> =
@@ -551,11 +550,11 @@ object InnertubeParser {
     fun parseLibraryItems(root: JsonElement): List<ShelfItem> =
         collectRenderers(root, "musicTwoRowItemRenderer").mapNotNull { parseTwoRowItem(it) }
 
-    fun parsePlaylistShelf(root: JsonElement): YtMusicRepository.PlaylistShelfPage? {
+    fun parsePlaylistShelf(root: JsonElement): PlaylistShelfPage? {
         val playlistScope = collectRenderers(root, "musicPlaylistShelfRenderer").firstOrNull() ?: return null
         val songs = collectRenderers(playlistScope, "musicResponsiveListItemRenderer").mapNotNull { parseResponsiveListItem(it) }.distinctBy { it.videoId }
         val token = continuationToken(playlistScope)
-        return YtMusicRepository.PlaylistShelfPage(songs, emptyList(), token)
+        return PlaylistShelfPage(songs, emptyList(), token)
     }
 
     fun continuationToken(root: JsonElement): String? {
