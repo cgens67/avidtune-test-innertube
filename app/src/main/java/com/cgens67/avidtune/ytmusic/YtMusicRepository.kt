@@ -30,18 +30,21 @@ object StreamResolver {
                         .header("User-Agent", PlayerClient.WEB_USER_AGENT)
                         .build()
                     BitChordInnertube.okHttpClient.newCall(req).execute().use { resp ->
+                        val bodyString = resp.body?.string()
+                        val latestUrl = resp.request.url.toString()
                         return Response(
                             resp.code,
                             resp.message,
                             resp.headers.toMultimap(),
-                            resp.body?.string(),
-                            resp.request.url.toString()
+                            bodyString,
+                            bodyString?.toByteArray(),
+                            latestUrl
                         )
                     }
                 }
 
                 override fun executeAsync(request: Request, callback: AsyncCallback?): CancellableCall {
-                    return CancellableCall { }
+                    throw UnsupportedOperationException()
                 }
             })
         }
@@ -110,9 +113,6 @@ object YtMusicRepository {
     const val PLAYLISTS_SHELF = "Playlists"
     private const val LIBRARY_PLAYLISTS = "FEmusic_liked_playlists"
 
-    data class SearchPage(val rows: List<SearchResult>, val continuation: String?)
-    data class PlaylistShelfPage(val songs: List<Song>, val suggested: List<Song>, val continuation: String?)
-
     suspend fun home(): Result<HomeFeed> = call {
         val res = BitChordInnertube.browse("FEmusic_home")
         HomeFeed(InnertubeParser.parseHome(res), InnertubeParser.continuationToken(res))
@@ -135,9 +135,9 @@ object YtMusicRepository {
         InnertubeParser.parseSearchSuggestions(BitChordInnertube.searchSuggestions(input))
     }
 
-    suspend fun browseSongs(browseId: String): Result<InnertubeParser.PlaylistShelfPage> = call {
+    suspend fun browseSongs(browseId: String): Result<PlaylistShelfPage> = call {
         val res = BitChordInnertube.browse(browseId)
-        InnertubeParser.parsePlaylistShelf(res) ?: InnertubeParser.PlaylistShelfPage(InnertubeParser.collectSongsDeep(res), emptyList(), null)
+        InnertubeParser.parsePlaylistShelf(res) ?: PlaylistShelfPage(InnertubeParser.collectSongsDeep(res), emptyList(), null)
     }
 
     suspend fun allSongs(browseId: String): Result<List<Song>> = call {
