@@ -36,6 +36,7 @@ import com.cgens67.avidtune.extensions.toInetSocketAddress
 import com.cgens67.avidtune.utils.dataStore
 import com.cgens67.avidtune.utils.get
 import com.cgens67.avidtune.utils.reportException
+import com.cgens67.avidtune.ytmusic.BitChordInnertube
 import com.cgens67.paxsenix.Paxsenix
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.DelicateCoroutinesApi
@@ -55,13 +56,13 @@ class App : Application(), ImageLoaderFactory {
     @OptIn(DelicateCoroutinesApi::class)
     override fun onCreate() {
         super.onCreate()
-        instance = this;
+        instance = this
         Timber.plant(Timber.DebugTree())
 
         Paxsenix.init(this)
 
         val locale = Locale.getDefault()
-        val languageTag = locale.toLanguageTag().replace("-Hant", "") // replace zh-Hant-* to zh-*
+        val languageTag = locale.toLanguageTag().replace("-Hant", "")
         YouTube.locale = YouTubeLocale(
             gl = dataStore[ContentCountryKey]?.takeIf { it != SYSTEM_DEFAULT }
                 ?: locale.country.takeIf { it in CountryCodeToName }
@@ -71,6 +72,8 @@ class App : Application(), ImageLoaderFactory {
                 ?: languageTag.takeIf { it in LanguageCodeToName }
                 ?: "en"
         )
+        BitChordInnertube.currentLanguage = YouTube.locale.hl
+
         if (languageTag == "zh-TW") {
             KuGou.useTraditionalChinese = true
         }
@@ -96,12 +99,10 @@ class App : Application(), ImageLoaderFactory {
                 .map { it[VisitorDataKey] }
                 .distinctUntilChanged()
                 .collect { visitorData ->
-                    YouTube.visitorData = visitorData
-                        ?.takeIf { it != "null" } // Previously visitorData was sometimes saved as "null" due to a bug
+                    val resolved = visitorData?.takeIf { it != "null" }
                         ?: YouTube.visitorData().onFailure {
                             withContext(Dispatchers.Main) {
-                                Toast.makeText(this@App, "Failed to get visitorData.", LENGTH_SHORT)
-                                    .show()
+                                Toast.makeText(this@App, "Failed to get visitorData.", LENGTH_SHORT).show()
                             }
                             reportException(it)
                         }.getOrNull()?.also { newVisitorData ->
@@ -109,6 +110,8 @@ class App : Application(), ImageLoaderFactory {
                                 settings[VisitorDataKey] = newVisitorData
                             }
                         }
+                    YouTube.visitorData = resolved
+                    BitChordInnertube.visitorData = resolved
                 }
         }
         GlobalScope.launch {
@@ -116,20 +119,12 @@ class App : Application(), ImageLoaderFactory {
                 .map { it[DataSyncIdKey] }
                 .distinctUntilChanged()
                 .collect { dataSyncId ->
-                    YouTube.dataSyncId = dataSyncId?.let {
-                        /*
-                         * Workaround to avoid breaking older installations that have a dataSyncId
-                         * that contains "||" in it.
-                         * If the dataSyncId ends with "||" and contains only one id, then keep the
-                         * id before the "||".
-                         * If the dataSyncId contains "||" and is not at the end, then keep the
-                         * second id.
-                         * This is needed to keep using the same account as before.
-                         */
+                    val resolvedId = dataSyncId?.let {
                         it.takeIf { !it.contains("||") }
                             ?: it.takeIf { it.endsWith("||") }?.substringBefore("||")
                             ?: it.substringAfter("||")
                     }
+                    YouTube.dataSyncId = resolvedId
                 }
         }
         GlobalScope.launch {
@@ -139,8 +134,8 @@ class App : Application(), ImageLoaderFactory {
                 .collect { cookie ->
                     try {
                         YouTube.cookie = cookie
+                        BitChordInnertube.cookie = cookie
                     } catch (e: Exception) {
-                        // we now allow user input now, here be the demons. This serves as a last ditch effort to avoid a crash loop
                         Timber.e("Could not parse cookie. Clearing existing cookie. %s", e.message)
                         forgetAccount(this@App)
                     }
@@ -151,7 +146,6 @@ class App : Application(), ImageLoaderFactory {
     override fun newImageLoader(): ImageLoader {
         val cacheSize = dataStore[MaxImageCacheSizeKey]
 
-        // will crash app if you set to 0 after cache starts being used
         if (cacheSize == 0) {
             return ImageLoader.Builder(this)
                 .crossfade(true)
