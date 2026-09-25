@@ -118,6 +118,7 @@ import com.cgens67.avidtune.utils.dataStore
 import com.cgens67.avidtune.utils.enumPreference
 import com.cgens67.avidtune.utils.get
 import com.cgens67.avidtune.utils.reportException
+import com.cgens67.avidtune.ytmusic.StreamResolver
 import com.cgens67.innertube.YouTube
 import com.cgens67.innertube.models.SongItem
 import com.cgens67.innertube.models.WatchEndpoint
@@ -836,7 +837,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
                 val orderAfter = mutableListOf<Int>()
                 var idx = currentIndex
                 while (true) {
-                    idx = timeline.getNextWindowIndex(idx, Player.REPEAT_MODE_OFF, /*shuffleModeEnabled=*/true)
+                    idx = timeline.getNextWindowIndex(idx, Player.REPEAT_MODE_OFF, true)
                     if (idx == C.INDEX_UNSET) break
                     if (idx != currentIndex) orderAfter.add(idx)
                 }
@@ -844,7 +845,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
                 val prevList = mutableListOf<Int>()
                 var pIdx = currentIndex
                 while (true) {
-                    pIdx = timeline.getPreviousWindowIndex(pIdx, Player.REPEAT_MODE_OFF, /*shuffleModeEnabled=*/true)
+                    pIdx = timeline.getPreviousWindowIndex(pIdx, Player.REPEAT_MODE_OFF, true)
                     if (pIdx == C.INDEX_UNSET) break
                     if (pIdx != currentIndex) prevList.add(pIdx)
                 }
@@ -1132,7 +1133,6 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         super.onPlayerError(error)
         Log.e(TAG, "Player error: ${error.errorCodeName}, message: ${error.message}", error)
         
-        // FIX: Clear stale VisitorData so a fresh one is generated for the next track
         runBlocking {
             dataStore.edit { it.remove(com.cgens67.avidtune.constants.VisitorDataKey) }
         }
@@ -1243,6 +1243,21 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
                 }
                 return@Factory dataSpec.withUri(it.first.toUri())
             }
+
+            // PRIMARY RESOLUTION: BitChord StreamResolver
+            val bitChordUrl = runCatching {
+                runBlocking(Dispatchers.IO) {
+                    StreamResolver.resolve(mediaId)
+                }
+            }.getOrNull()
+
+            if (!bitChordUrl.isNullOrBlank()) {
+                songUrlCache[mediaId] = bitChordUrl to (System.currentTimeMillis() + 20 * 60 * 1000L)
+                scope.launch(Dispatchers.IO) {
+                    recoverSong(mediaId)
+                }
+                return@Factory dataSpec.withUri(bitChordUrl.toUri())
+            }
             
             val ytLogTag = "YouTube"
             try {
@@ -1304,7 +1319,6 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             } catch (e: Exception) {
                 Timber.tag(ytLogTag).e(e, "YouTube playback error, trying JossRed as fallback")
                 
-                // FIX: Invalidate stale VisitorData on 403 / IO_UNSPECIFIED errors
                 runBlocking {
                     dataStore.edit { it.remove(com.cgens67.avidtune.constants.VisitorDataKey) }
                 }
