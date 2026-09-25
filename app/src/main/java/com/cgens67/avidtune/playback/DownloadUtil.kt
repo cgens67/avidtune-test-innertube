@@ -21,6 +21,7 @@ import com.cgens67.avidtune.di.DownloadCache
 import com.cgens67.avidtune.di.PlayerCache
 import com.cgens67.avidtune.utils.YTPlayerUtils
 import com.cgens67.avidtune.utils.enumPreference
+import com.cgens67.avidtune.ytmusic.StreamResolver
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -71,6 +72,18 @@ constructor(
 
             songUrlCache[mediaId]?.takeIf { it.second > System.currentTimeMillis() }?.let {
                 return@Factory dataSpec.withUri(it.first.toUri())
+            }
+
+            // BitChord StreamResolver resolution for downloads
+            val bitChordUrl = runCatching {
+                runBlocking(Dispatchers.IO) {
+                    StreamResolver.resolve(mediaId)
+                }
+            }.getOrNull()
+
+            if (!bitChordUrl.isNullOrBlank()) {
+                songUrlCache[mediaId] = bitChordUrl to (System.currentTimeMillis() + 20 * 60 * 1000L)
+                return@Factory dataSpec.withUri(bitChordUrl.toUri())
             }
 
             val playedFormat = runBlocking(Dispatchers.IO) { database.format(mediaId).first() }
