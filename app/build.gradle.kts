@@ -12,7 +12,6 @@ plugins {
 
 android {
     namespace = "com.cgens67.avidtune"
-    //noinspection GradleDependency
     compileSdk = 35
 
     defaultConfig {
@@ -94,7 +93,6 @@ android {
         includeInApk = false
         includeInBundle = false
     }
-
 }
 
 ksp {
@@ -166,6 +164,9 @@ dependencies {
     implementation(project(":betterlyrics"))
     implementation(project(":paxsenix"))
     implementation(project(":simpmusic"))
+
+    // BitChord Stream Extractor
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.24.4")
 
     implementation(libs.ktor.client.core)
     implementation(libs.ktor.client.cio)
