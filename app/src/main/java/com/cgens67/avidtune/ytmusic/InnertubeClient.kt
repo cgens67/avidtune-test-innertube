@@ -15,56 +15,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
-
-// ==========================================
-// Client Identifier Profiles
-// ==========================================
-
-data class PlayerClient(
-    val clientName: String,
-    val clientVersion: String,
-    val userAgent: String,
-    val origin: String? = null,
-) {
-    val referer: String? get() = origin?.let { "$it/" }
-    fun mediaHeaders(): Map<String, String> = buildMap {
-        put("User-Agent", userAgent)
-        origin?.let { put("Origin", it) }
-        referer?.let { put("Referer", it) }
-    }
-
-    companion object {
-        const val MUSIC_ORIGIN = "https://music.youtube.com"
-        const val YOUTUBE_ORIGIN = "https://www.youtube.com"
-        const val WEB_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-
-        val IOS = PlayerClient("IOS", "21.26.4", "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)")
-        val ANDROID = PlayerClient("ANDROID", "21.26.364", "com.google.android.youtube/21.26.364 (Linux; U; Android 15; en_US; Pixel 9 Pro) gzip")
-        val WEB_REMIX = PlayerClient("WEB_REMIX", "1.20260707.12.00", WEB_USER_AGENT, MUSIC_ORIGIN)
-
-        fun forStreamUrl(url: String): PlayerClient {
-            val parsed = url.toHttpUrlOrNull() ?: return IOS
-            val name = parsed.queryParameter("c")?.uppercase(Locale.ROOT) ?: return IOS
-            return when {
-                name.startsWith("IOS") -> IOS
-                name.startsWith("ANDROID") -> ANDROID
-                name.startsWith("WEB_REMIX") -> WEB_REMIX
-                else -> IOS
-            }
-        }
-
-        fun rangeBytesFor(url: String): Long {
-            val parsed = url.toHttpUrlOrNull() ?: return Long.MAX_VALUE
-            if (!parsed.host.endsWith("googlevideo.com")) return Long.MAX_VALUE
-            return 1024L * 1024
-        }
-    }
-}
 
 // ==========================================
 // InnerTube Core Network Service
@@ -234,7 +188,6 @@ object BitChordInnertube {
         error("Request failed")
     }
 
-    // Endpoints
     suspend fun browse(browseId: String, params: String? = null): JsonObject = postMusic("browse") {
         put("browseId", browseId)
         params?.let { put("params", it) }
