@@ -21,6 +21,7 @@ import com.cgens67.avidtune.di.DownloadCache
 import com.cgens67.avidtune.di.PlayerCache
 import com.cgens67.avidtune.utils.YTPlayerUtils
 import com.cgens67.avidtune.utils.enumPreference
+import com.cgens67.avidtune.ytmusic.PlayerClient
 import com.cgens67.avidtune.ytmusic.StreamResolver
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -53,12 +54,25 @@ constructor(
             CacheDataSource
                 .Factory()
                 .setCache(playerCache)
-                .setCacheWriteDataSinkFactory(null) // Prevent writing to playerCache during downloads
+                .setCacheWriteDataSinkFactory(null)
                 .setUpstreamDataSourceFactory(
                     OkHttpDataSource.Factory(
-                        OkHttpClient
-                            .Builder()
+                        OkHttpClient.Builder()
                             .proxy(YouTube.proxy)
+                            .addInterceptor { chain ->
+                                val request = chain.request()
+                                val urlStr = request.url.toString()
+                                if (urlStr.contains("googlevideo.com")) {
+                                    val clientProfile = PlayerClient.forStreamUrl(urlStr)
+                                    val builder = request.newBuilder()
+                                    clientProfile.mediaHeaders().forEach { (k, v) ->
+                                        builder.header(k, v)
+                                    }
+                                    chain.proceed(builder.build())
+                                } else {
+                                    chain.proceed(request)
+                                }
+                            }
                             .build(),
                     ),
                 ),
