@@ -22,21 +22,29 @@ object StreamResolver {
 
     private val recent = ConcurrentHashMap<String, Pair<String, Long>>()
     private val newPipeInit by lazy {
-        NewPipe.init(object : Downloader() {
-            override fun execute(request: Request): Response {
-                val req = okhttp3.Request.Builder()
-                    .url(request.url())
-                    .header("User-Agent", PlayerClient.WEB_USER_AGENT)
-                    .build()
-                BitChordInnertube.okHttpClient.newCall(req).execute().use { resp ->
-                    return Response(resp.code, resp.message, resp.headers.toMultimap(), resp.body?.string(), resp.request.url.toString())
+        if (NewPipe.getDownloader() == null) {
+            NewPipe.init(object : Downloader() {
+                override fun execute(request: Request): Response {
+                    val req = okhttp3.Request.Builder()
+                        .url(request.url())
+                        .header("User-Agent", PlayerClient.WEB_USER_AGENT)
+                        .build()
+                    BitChordInnertube.okHttpClient.newCall(req).execute().use { resp ->
+                        return Response(
+                            resp.code,
+                            resp.message,
+                            resp.headers.toMultimap(),
+                            resp.body?.string(),
+                            resp.request.url.toString()
+                        )
+                    }
                 }
-            }
 
-            override fun executeAsync(request: Request, callback: AsyncCallback?): CancellableCall? {
-                return null
-            }
-        })
+                override fun executeAsync(request: Request, callback: AsyncCallback?): CancellableCall {
+                    return CancellableCall { }
+                }
+            })
+        }
     }
 
     suspend fun resolve(videoId: String): String = withContext(Dispatchers.IO) {
