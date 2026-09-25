@@ -8,7 +8,6 @@ import com.cgens67.innertube.models.YouTubeLocale
 import com.cgens67.innertube.models.body.*
 import com.cgens67.innertube.models.response.NextResponse
 import com.cgens67.innertube.utils.parseCookieString
-import com.cgens67.innertube.utils.sha1
 import io.ktor.client.*
 import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.*
@@ -20,11 +19,16 @@ import io.ktor.client.request.*
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
-import kotlinx.serialization.ExperimentalSerializationApi
-import kotlinx.serialization.json.Json
-import java.net.Proxy
-import java.io.IOException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.json.*
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
+import java.net.Proxy
+import java.security.MessageDigest
 import java.util.*
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
@@ -35,16 +39,25 @@ class InnerTube {
 
     private companion object {
         const val PLAYBACK_TELEMETRY_VER = "2"
+        const val DEFAULT_WEB_REMIX_VERSION = "1.20260707.12.00"
+        const val WEB_USER_AGENT = YouTubeClient.USER_AGENT_WEB
+        val VISITOR_DATA_REGEX = Regex("""Cg[A-Za-z0-9_%-]{40,}""")
     }
 
     var locale = YouTubeLocale(
-        gl = Locale.getDefault().country,
-        hl = Locale.getDefault().toLanguageTag()
+        gl = Locale.getDefault().country.ifEmpty { "US" },
+        hl = Locale.getDefault().toLanguageTag().ifEmpty { "en-US" }
     )
+
     var visitorData: String? = null
     var dataSyncId: String? = null
     var cookie: String? = null
         set(value) {
+            if (field != value) {
+                scope = null
+                visitorData = null
+                channelOverride = null
+            }
             field = value
             cookieMap = if (value == null) emptyMap() else parseCookieString(value)
         }
@@ -56,10 +69,120 @@ class InnerTube {
             httpClient.close()
             httpClient = createClient()
         }
-    
-    var proxyAuth: String? = null
 
+    var proxyAuth: String? = null
     var useLoginForBrowse: Boolean = false
+
+    // ==========================================
+    // BitChord Session Scope & Channel Switcher
+    // ==========================================
+
+    private class SessionScope(
+        val dataSyncId: String?,
+        val pageId: String?,
+        val authUser: String,
+        val clientVersion: String?
+    )
+
+    class ChannelSelection(
+        val pageId: String?,
+        val dataSyncId: String?,
+        val authUser: String? = null
+    )
+
+    @Volatile
+    private var scope: SessionScope? = null
+    private val scopeLock = Mutex()
+
+    @Volatile
+    private var channelOverride: ChannelSelection? = null
+
+    val liveWebRemixVersion: String
+        get() = scope?.clientVersion ?: DEFAULT_WEB_REMIX_VERSION
+
+    fun selectChannel(pageId: String?, dataSyncId: String?, authUser: String? = null) {
+        channelOverride = if (pageId == null && dataSyncId == null) {
+            null
+        } else {
+            ChannelSelection(pageId, dataSyncId, authUser)
+        }
+    }
+
+    suspend fun ensureSessionScope() {
+        val session = cookie ?: return
+        if (scope != null) return
+        scopeLock.withLock {
+            if (scope != null || cookie != session) return
+            runCatching {
+                val html = httpClient.get(YouTubeClient.ORIGIN_YOUTUBE_MUSIC + "/") {
+                    header("User-Agent", WEB_USER_AGENT)
+                    header("Accept-Language", locale.hl)
+                    header("Cookie", session)
+                    sapisidFrom(session)?.let { header("Authorization", sapisidHash(it)) }
+                }.bodyAsText()
+
+                val signedIn = Regex(""""LOGGED_IN"\s*:\s*(true|false)""").find(html)?.groupValues?.get(1) == "true"
+                val clientVersion = Regex(""""INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+                if (!signedIn) return@runCatching clientVersion?.let { SessionScope(null, null, "0", it) }
+
+                val pageId = Regex(""""DELEGATED_SESSION_ID"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
+                val rawDataSyncId = pageId ?: Regex(""""DATASYNC_ID"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+                val resolvedDataSyncId = normalizeDataSyncId(rawDataSyncId)
+                val authUser = Regex(""""SESSION_INDEX"\s*:\s*"?(\d+)""").find(html)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
+                Regex(""""VISITOR_DATA"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }?.let {
+                    visitorData = it
+                }
+                SessionScope(resolvedDataSyncId, pageId, authUser ?: "0", clientVersion)
+            }.getOrNull()?.let {
+                scope = it
+                if (dataSyncId == null && it.dataSyncId != null) {
+                    dataSyncId = it.dataSyncId
+                }
+            }
+        }
+    }
+
+    suspend fun ensureVisitorData(refresh: Boolean = false): String? {
+        if (!refresh && visitorData != null) return visitorData
+        runCatching {
+            val body = httpClient.get("https://www.youtube.com/sw.js_data") {
+                header("User-Agent", WEB_USER_AGENT)
+            }.bodyAsText()
+            val payload = Json.parseToJsonElement(body.substringAfter("\n", body.drop(5)))
+            findVisitorData(payload)
+        }.getOrNull()?.let { visitorData = it }
+        return visitorData
+    }
+
+    private fun findVisitorData(element: JsonElement): String? = when (element) {
+        is JsonArray -> element.firstNotNullOfOrNull { findVisitorData(it) }
+        is JsonPrimitive -> element.contentOrNull?.takeIf { VISITOR_DATA_REGEX.matches(it) }
+        else -> null
+    }
+
+    private fun normalizeDataSyncId(raw: String?): String? {
+        val value = raw?.takeIf { it.isNotBlank() } ?: return null
+        if (!value.contains("||")) return value
+        return value.substringAfter("||").takeIf { it.isNotBlank() }
+            ?: value.substringBefore("||").takeIf { it.isNotBlank() }
+    }
+
+    private fun sapisidFrom(cookieHeader: String): String? {
+        val jar = cookieHeader.split(';').mapNotNull { entry ->
+            val n = entry.substringBefore('=').trim()
+            val v = entry.substringAfter('=', "").trim()
+            if (n.isEmpty() || v.isEmpty()) null else n to v
+        }.toMap()
+        return listOf("SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID").firstNotNullOfOrNull { jar[it] }
+    }
+
+    private fun sapisidHash(sapisid: String, origin: String = YouTubeClient.ORIGIN_YOUTUBE_MUSIC): String {
+        val timestamp = System.currentTimeMillis() / 1000
+        val digest = MessageDigest.getInstance("SHA-1")
+            .digest("$timestamp $sapisid $origin".toByteArray())
+            .joinToString("") { "%02x".format(Locale.ROOT, it) }
+        return "SAPISIDHASH ${timestamp}_$digest"
+    }
 
     @OptIn(ExperimentalSerializationApi::class)
     private fun createClient() = HttpClient(OkHttp) {
@@ -81,11 +204,7 @@ class InnerTube {
         engine {
             config {
                 connectionPool(
-                    okhttp3.ConnectionPool(
-                        10,
-                        5,
-                        java.util.concurrent.TimeUnit.MINUTES
-                    )
+                    okhttp3.ConnectionPool(10, 5, java.util.concurrent.TimeUnit.MINUTES)
                 )
                 connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
                 readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
@@ -94,7 +213,7 @@ class InnerTube {
                 retryOnConnectionFailure(true)
                 cache(
                     okhttp3.Cache(
-                        directory = java.io.File(System.getProperty("java.io.tmpdir"), "http_cache"),
+                        directory = File(System.getProperty("java.io.tmpdir"), "http_cache"),
                         maxSize = 50L * 1024L * 1024L
                     )
                 )
@@ -125,22 +244,28 @@ class InnerTube {
         }
     }
 
-    private fun HttpRequestBuilder.ytClient(client: YouTubeClient, setLogin: Boolean = false) {
+    private suspend fun HttpRequestBuilder.ytClient(client: YouTubeClient, setLogin: Boolean = false) {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val clientVersion = if (client.clientName == "WEB_REMIX") (s?.clientVersion ?: client.clientVersion) else client.clientVersion
+
         contentType(ContentType.Application.Json)
         headers {
             append("X-Goog-Api-Format-Version", "1")
             append("X-YouTube-Client-Name", client.clientId)
-            append("X-YouTube-Client-Version", client.clientVersion)
+            append("X-YouTube-Client-Version", clientVersion)
             append("X-Origin", YouTubeClient.ORIGIN_YOUTUBE_MUSIC)
+            append("Origin", YouTubeClient.ORIGIN_YOUTUBE_MUSIC)
             append("Referer", YouTubeClient.REFERER_YOUTUBE_MUSIC)
             visitorData?.let { append("X-Goog-Visitor-Id", it) }
             if (setLogin && client.loginSupported) {
-                cookie?.let { cookie ->
-                    append("cookie", cookie)
-                    if ("SAPISID" !in cookieMap) return@let
-                    val currentTime = System.currentTimeMillis() / 1000
-                    val sapisidHash = sha1("$currentTime ${cookieMap["SAPISID"]} ${YouTubeClient.ORIGIN_YOUTUBE_MUSIC}")
-                    append("Authorization", "SAPISIDHASH ${currentTime}_${sapisidHash}")
+                cookie?.let { c ->
+                    append("Cookie", c)
+                    val authUser = channelOverride?.authUser ?: s?.authUser ?: "0"
+                    append("X-Goog-AuthUser", authUser)
+                    val pageId = channelOverride?.pageId ?: s?.pageId
+                    pageId?.let { append("X-Goog-PageId", it) }
+                    sapisidFrom(c)?.let { append("Authorization", sapisidHash(it)) }
                 }
             }
         }
@@ -159,7 +284,8 @@ class InnerTube {
         while (true) {
             try {
                 return block()
-            } catch (e: IOException) {
+            } catch (e: Exception) {
+                if (e is HttpRequestTimeoutException) throw e
                 attempt++
                 if (attempt >= maxAttempts) throw e
                 delay(currentDelay)
@@ -178,11 +304,7 @@ class InnerTube {
             ytClient(client, setLogin = false)
             setBody(
                 SearchBody(
-                    context = client.toContext(
-                        locale,
-                        visitorData,
-                        null
-                    ),
+                    context = client.toContext(locale, visitorData, null),
                     query = query,
                     params = params
                 )
@@ -199,11 +321,15 @@ class InnerTube {
         signatureTimestamp: Int?,
         poToken: String? = null,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("player") {
             ytClient(client, setLogin = true)
             setBody(
                 PlayerBody(
-                    context = client.toContext(locale, visitorData, dataSyncId).let {
+                    context = client.toContext(locale, visitorData, activeDataSyncId).let {
                         if (client.isEmbedded) {
                             it.copy(
                                 thirdParty = Context.ThirdParty(
@@ -216,9 +342,7 @@ class InnerTube {
                     playlistId = playlistId,
                     playbackContext = if (client.useSignatureTimestamp && signatureTimestamp != null) {
                         PlayerBody.PlaybackContext(
-                            PlayerBody.PlaybackContext.ContentPlaybackContext(
-                                signatureTimestamp
-                            )
+                            PlayerBody.PlaybackContext.ContentPlaybackContext(signatureTimestamp)
                         )
                     } else null,
                     serviceIntegrityDimensions = if (client.useWebPoTokens && poToken != null) {
@@ -235,11 +359,19 @@ class InnerTube {
         playlistId: String?,
         client: YouTubeClient = YouTubeClient.WEB_REMIX,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
         httpClient.get(url) {
             ytClient(client, true)
             parameter("c", client.clientName)
+            parameter("cver", liveWebRemixVersion)
             parameter("cpn", cpn)
             parameter("ver", PLAYBACK_TELEMETRY_VER)
+            parameter("cplayer", "UNIPLAYER")
+            parameter("cbr", "Chrome")
+            parameter("cbrver", "141.0.0.0")
+            parameter("cos", "Windows")
+            parameter("cosver", "10.0")
 
             if (playlistId != null) {
                 parameter("list", playlistId)
@@ -255,15 +387,15 @@ class InnerTube {
         continuation: String? = null,
         setLogin: Boolean = false,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = if (setLogin || useLoginForBrowse) (channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId) else null
+
         httpClient.post("browse") {
             ytClient(client, setLogin = setLogin || useLoginForBrowse)
             setBody(
                 BrowseBody(
-                    context = client.toContext(
-                        locale,
-                        visitorData,
-                        if (setLogin || useLoginForBrowse) dataSyncId else null
-                    ),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     browseId = browseId,
                     params = params,
                     continuation = continuation
@@ -281,11 +413,15 @@ class InnerTube {
         params: String?,
         continuation: String? = null,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("next") {
             ytClient(client, setLogin = true)
             setBody(
                 NextBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     videoId = videoId,
                     playlistId = playlistId,
                     playlistSetVideoId = playlistSetVideoId,
@@ -301,11 +437,15 @@ class InnerTube {
         client: YouTubeClient,
         tokens: List<String>
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("feedback") {
             ytClient(client, setLogin = true)
             setBody(
                 FeedbackBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     feedbackTokens = tokens
                 )
             )
@@ -367,9 +507,13 @@ class InnerTube {
     suspend fun getSwJsData() = withRetry { httpClient.get("https://music.youtube.com/sw.js_data") }
 
     suspend fun accountMenu(client: YouTubeClient) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("account/account_menu") {
             ytClient(client, setLogin = true)
-            setBody(AccountMenuBody(client.toContext(locale, visitorData, dataSyncId)))
+            setBody(AccountMenuBody(client.toContext(locale, visitorData, activeDataSyncId)))
         }
     }
 
@@ -377,11 +521,15 @@ class InnerTube {
         client: YouTubeClient,
         videoId: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("like/like") {
             ytClient(client, setLogin = true)
             setBody(
                 LikeBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     target = LikeBody.Target.video(videoId)
                 )
             )
@@ -392,11 +540,15 @@ class InnerTube {
         client: YouTubeClient,
         videoId: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("like/removelike") {
             ytClient(client, setLogin = true)
             setBody(
                 LikeBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     target = LikeBody.Target.video(videoId)
                 )
             )
@@ -408,11 +560,15 @@ class InnerTube {
         channelId: String,
         params: String? = null,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("subscription/subscribe") {
             ytClient(client, setLogin = true)
             setBody(
                 SubscribeBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     channelIds = listOf(channelId),
                     params = params
                 )
@@ -425,11 +581,15 @@ class InnerTube {
         channelId: String,
         params: String? = null,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("subscription/unsubscribe") {
             ytClient(client, setLogin = true)
             setBody(
                 SubscribeBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     channelIds = listOf(channelId),
                     params = params
                 )
@@ -441,11 +601,15 @@ class InnerTube {
         client: YouTubeClient,
         playlistId: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("like/like") {
             ytClient(client, setLogin = true)
             setBody(
                 LikeBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     target = LikeBody.Target.playlist(playlistId)
                 )
             )
@@ -456,11 +620,15 @@ class InnerTube {
         client: YouTubeClient,
         playlistId: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("like/removelike") {
             ytClient(client, setLogin = true)
             setBody(
                 LikeBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     target = LikeBody.Target.playlist(playlistId)
                 )
             )
@@ -472,11 +640,15 @@ class InnerTube {
         playlistId: String,
         videoId: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("browse/edit_playlist") {
             ytClient(client, setLogin = true)
             setBody(
                 EditPlaylistBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     playlistId = playlistId.removePrefix("VL"),
                     actions = listOf(
                         Action.AddVideoAction(addedVideoId = videoId)
@@ -491,11 +663,15 @@ class InnerTube {
         playlistId: String,
         addPlaylistId: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("browse/edit_playlist") {
             ytClient(client, setLogin = true)
             setBody(
                 EditPlaylistBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     playlistId = playlistId.removePrefix("VL"),
                     actions = listOf(
                         Action.AddPlaylistAction(addedFullListId = addPlaylistId)
@@ -511,11 +687,15 @@ class InnerTube {
         videoId: String,
         setVideoId: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("browse/edit_playlist") {
             ytClient(client, setLogin = true)
             setBody(
                 EditPlaylistBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     playlistId = playlistId.removePrefix("VL"),
                     actions = listOf(
                         Action.RemoveVideoAction(
@@ -534,11 +714,15 @@ class InnerTube {
         setVideoId: String,
         successorSetVideoId: String?,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("browse/edit_playlist") {
             ytClient(client, setLogin = true)
             setBody(
                 EditPlaylistBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     playlistId = playlistId,
                     actions = listOf(
                         Action.MoveVideoAction(
@@ -555,11 +739,15 @@ class InnerTube {
         client: YouTubeClient,
         title: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("playlist/create") {
             ytClient(client, true)
             setBody(
                 CreatePlaylistBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     title = title
                 )
             )
@@ -571,11 +759,15 @@ class InnerTube {
         playlistId: String,
         name: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("browse/edit_playlist") {
             ytClient(client, setLogin = true)
             setBody(
                 EditPlaylistBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     playlistId = playlistId,
                     actions = listOf(
                         Action.RenamePlaylistAction(
@@ -586,7 +778,7 @@ class InnerTube {
             )
         }
     }
-    
+
     suspend fun getUploadCustomThumbnailLink(
         client: YouTubeClient,
         contentLength: Int
@@ -623,11 +815,15 @@ class InnerTube {
         playlistId: String,
         blobId: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("browse/edit_playlist") {
             ytClient(client, setLogin = true)
             setBody(
                 EditPlaylistBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     playlistId = playlistId,
                     actions = listOf(
                         Action.SetCustomThumbnailAction(
@@ -645,11 +841,15 @@ class InnerTube {
         client: YouTubeClient,
         playlistId: String
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("browse/edit_playlist") {
             ytClient(client, setLogin = true)
             setBody(
                 EditPlaylistBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     playlistId = playlistId,
                     actions = listOf(
                         Action.RemoveCustomThumbnailAction()
@@ -663,11 +863,15 @@ class InnerTube {
         client: YouTubeClient,
         playlistId: String,
     ) = withRetry {
+        if (cookie != null) ensureSessionScope()
+        val s = scope
+        val activeDataSyncId = channelOverride?.dataSyncId ?: s?.dataSyncId ?: dataSyncId
+
         httpClient.post("playlist/delete") {
             ytClient(client, setLogin = true)
             setBody(
                 PlaylistDeleteBody(
-                    context = client.toContext(locale, visitorData, dataSyncId),
+                    context = client.toContext(locale, visitorData, activeDataSyncId),
                     playlistId = playlistId
                 )
             )
@@ -692,12 +896,9 @@ class InnerTube {
                 append("X-Goog-Upload-Header-Content-Length", contentLength.toString())
                 append("X-Goog-AuthUser", authUser)
                 append("Origin", YouTubeClient.ORIGIN_YOUTUBE_MUSIC)
-                cookie?.let { cookie ->
-                    append("cookie", cookie)
-                    if ("SAPISID" !in cookieMap) return@let
-                    val currentTime = System.currentTimeMillis() / 1000
-                    val sapisidHash = sha1("$currentTime ${cookieMap["SAPISID"]} ${YouTubeClient.ORIGIN_YOUTUBE_MUSIC}")
-                    append("Authorization", "SAPISIDHASH ${currentTime}_${sapisidHash}")
+                cookie?.let { c ->
+                    append("Cookie", c)
+                    sapisidFrom(c)?.let { append("Authorization", sapisidHash(it)) }
                 }
             }
             contentType(ContentType.Application.FormUrlEncoded)
@@ -716,12 +917,9 @@ class InnerTube {
                 append("X-Goog-Upload-Offset", "0")
                 append("X-Goog-AuthUser", "0")
                 append("Origin", YouTubeClient.ORIGIN_YOUTUBE_MUSIC)
-                cookie?.let { cookie ->
-                    append("cookie", cookie)
-                    if ("SAPISID" !in cookieMap) return@let
-                    val currentTime = System.currentTimeMillis() / 1000
-                    val sapisidHash = sha1("$currentTime ${cookieMap["SAPISID"]} ${YouTubeClient.ORIGIN_YOUTUBE_MUSIC}")
-                    append("Authorization", "SAPISIDHASH ${currentTime}_${sapisidHash}")
+                cookie?.let { c ->
+                    append("Cookie", c)
+                    sapisidFrom(c)?.let { append("Authorization", sapisidHash(it)) }
                 }
             }
             contentType(ContentType.Application.OctetStream)
@@ -743,12 +941,9 @@ class InnerTube {
             headers {
                 append("Referer", YouTubeClient.REFERER_YOUTUBE_MUSIC)
                 append("Origin", YouTubeClient.ORIGIN_YOUTUBE_MUSIC)
-                cookie?.let { cookie ->
-                    append("cookie", cookie)
-                    if ("SAPISID" !in cookieMap) return@let
-                    val currentTime = System.currentTimeMillis() / 1000
-                    val sapisidHash = sha1("$currentTime ${cookieMap["SAPISID"]} ${YouTubeClient.ORIGIN_YOUTUBE_MUSIC}")
-                    append("Authorization", "SAPISIDHASH ${currentTime}_${sapisidHash}")
+                cookie?.let { c ->
+                    append("Cookie", c)
+                    sapisidFrom(c)?.let { append("Authorization", sapisidHash(it)) }
                 }
             }
             parameter("key", "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX3")
@@ -765,17 +960,15 @@ class InnerTube {
                     ?.results
                     ?.results
                     ?.content
-                    ?.find {
-                        it?.videoSecondaryInfoRenderer != null
-                    }?.videoSecondaryInfoRenderer
+                    ?.find { it?.videoSecondaryInfoRenderer != null }
+                    ?.videoSecondaryInfoRenderer
             val baseForTitle =
                 response.contents.twoColumnWatchNextResults
                     ?.results
                     ?.results
                     ?.content
-                    ?.find {
-                        it?.videoPrimaryInfoRenderer != null
-                    }?.videoPrimaryInfoRenderer
+                    ?.find { it?.videoPrimaryInfoRenderer != null }
+                    ?.videoPrimaryInfoRenderer
             val returnYouTubeDislikeResponse =
                 returnYouTubeDislike(videoId).body<ReturnYouTubeDislikeResponse>()
             return@runCatching MediaInfo(
