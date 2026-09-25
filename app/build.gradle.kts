@@ -165,8 +165,8 @@ dependencies {
     implementation(project(":paxsenix"))
     implementation(project(":simpmusic"))
 
-    // BitChord Stream Extractor
-    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.24.4")
+    // Unified NewPipe Extractor (fixes duplicate class conflict)
+    implementation(libs.newpipe.extractor)
 
     implementation(libs.ktor.client.core)
     implementation(libs.ktor.client.cio)
