@@ -108,6 +108,17 @@ sealed interface SearchResult {
     data class Browse(val item: BrowseItem) : SearchResult
 }
 
+data class SearchPage(
+    val rows: List<SearchResult>,
+    val continuation: String?
+)
+
+data class PlaylistShelfPage(
+    val songs: List<Song>,
+    val suggested: List<Song>,
+    val continuation: String?
+)
+
 enum class SearchFilter(val label: String, val params: String?) {
     ALL("All", null),
     SONGS("Songs", "EgWKAQIIAWoKEAkQChAFEAMQBA=="),
