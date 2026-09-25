@@ -1,9 +1,11 @@
 package com.cgens67.innertube.pages
 
+import com.cgens67.innertube.YouTube
 import com.cgens67.innertube.models.YouTubeClient
 import com.cgens67.innertube.models.response.PlayerResponse
 import io.ktor.http.URLBuilder
 import io.ktor.http.parseQueryString
+import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.schabi.newpipe.extractor.NewPipe
@@ -17,56 +19,54 @@ import org.schabi.newpipe.extractor.services.youtube.YoutubeJavaScriptPlayerMana
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.io.IOException
 import java.net.Proxy
-import com.cgens67.innertube.YouTube
+import java.util.concurrent.TimeUnit
 
 private class NewPipeDownloaderImpl(
     proxy: Proxy?,
     proxyAuth: String?,
 ) : Downloader() {
-    private fun normalizeResponseBody(
-        url: String,
-        body: String?,
-    ): String? {
-        if (!url.contains("returnyoutubedislikeapi.com", ignoreCase = true)) {
-            return body
-        }
 
-        val trimmed = body?.trimStart().orEmpty()
-        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-            return body
-        }
-
-        return "{\"likes\":0,\"dislikes\":0,\"viewCount\":0}"
-    }
+    private val NEXT_ENDPOINT = "/youtubei/v1/next"
+    private val EMPTY_NEXT_RESPONSE =
+        """{"responseContext":{},"contents":{},"currentVideoEndpoint":{},"trackingParams":""}"""
 
     private val client =
-        OkHttpClient
-            .Builder()
-            .proxy(proxy)
-            .proxyAuthenticator { _, response ->
+        OkHttpClient.Builder()
+            .connectionPool(ConnectionPool(4, 30, TimeUnit.SECONDS))
+            .pingInterval(5, TimeUnit.SECONDS)
+            .callTimeout(6, TimeUnit.SECONDS)
+            .apply {
+                proxy?.let { proxy(it) }
                 proxyAuth?.let { auth ->
-                    response.request
-                        .newBuilder()
-                        .header("Proxy-Authorization", auth)
-                        .build()
-                } ?: response.request
+                    proxyAuthenticator { _, response ->
+                        response.request.newBuilder()
+                            .header("Proxy-Authorization", auth)
+                            .build()
+                    }
+                }
             }.build()
 
     @Throws(IOException::class, ReCaptchaException::class)
     override fun execute(request: Request): Response {
+        // BitChord fix: intercept and drop the next endpoint so extraction doesn't hang for 12s
+        if (NEXT_ENDPOINT in request.url()) {
+            val bytes = EMPTY_NEXT_RESPONSE.toByteArray()
+            return Response(200, "OK", emptyMap(), EMPTY_NEXT_RESPONSE, bytes, request.url())
+        }
+
         val httpMethod = request.httpMethod()
         val url = request.url()
         val headers = request.headers()
         val dataToSend = request.dataToSend()
 
         val requestBuilder =
-            okhttp3.Request
-                .Builder()
+            okhttp3.Request.Builder()
                 .method(httpMethod, dataToSend?.toRequestBody())
                 .url(url)
-                .addHeader("User-Agent", YouTubeClient.USER_AGENT_WEB)
+                .header("User-Agent", YouTubeClient.USER_AGENT_WEB)
 
         headers.forEach { (headerName, headerValueList) ->
+            if (headerName.equals("User-Agent", ignoreCase = true)) return@forEach
             if (headerValueList.size > 1) {
                 requestBuilder.removeHeader(headerName)
                 headerValueList.forEach { headerValue ->
@@ -81,24 +81,25 @@ private class NewPipeDownloaderImpl(
 
         if (response.code == 429) {
             response.close()
-
             throw ReCaptchaException("reCaptcha Challenge requested", url)
         }
 
         val latestUrl = response.request.url.toString()
-        val responseBodyToReturn = normalizeResponseBody(latestUrl, response.body?.string())
+        val bodyString = response.body?.string()
+        val bodyBytes = bodyString?.toByteArray()
+
         return Response(
             response.code,
             response.message,
             response.headers.toMultimap(),
-            responseBodyToReturn,
-            responseBodyToReturn?.toByteArray(),
+            bodyString,
+            bodyBytes,
             latestUrl,
         )
     }
 
     override fun executeAsync(request: Request, callback: AsyncCallback?): CancellableCall {
-        TODO("Placeholder")
+        throw UnsupportedOperationException()
     }
 }
 
