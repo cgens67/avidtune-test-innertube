@@ -118,6 +118,7 @@ import com.cgens67.avidtune.utils.dataStore
 import com.cgens67.avidtune.utils.enumPreference
 import com.cgens67.avidtune.utils.get
 import com.cgens67.avidtune.utils.reportException
+import com.cgens67.avidtune.ytmusic.PlayerClient
 import com.cgens67.avidtune.ytmusic.StreamResolver
 import com.cgens67.innertube.YouTube
 import com.cgens67.innertube.models.SongItem
@@ -1133,6 +1134,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         super.onPlayerError(error)
         Log.e(TAG, "Player error: ${error.errorCodeName}, message: ${error.message}", error)
         
+        // Notify StreamResolver of potential dead streams so they aren't served from cache
+        player.currentMediaItem?.let { item ->
+            StreamResolver.onPlaybackRefused(item.mediaId, 403)
+        }
+
         runBlocking {
             dataStore.edit { it.remove(com.cgens67.avidtune.constants.VisitorDataKey) }
         }
@@ -1156,6 +1162,21 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             OkHttpDataSource.Factory(
                 OkHttpClient.Builder()
                     .proxy(YouTube.proxy)
+                    // Intercept media chunk fetches and match client headers (fixes CDN 403 Forbidden)
+                    .addInterceptor { chain ->
+                        val request = chain.request()
+                        val urlStr = request.url.toString()
+                        if (urlStr.contains("googlevideo.com")) {
+                            val clientProfile = PlayerClient.forStreamUrl(urlStr)
+                            val builder = request.newBuilder()
+                            clientProfile.mediaHeaders().forEach { (k, v) ->
+                                builder.header(k, v)
+                            }
+                            chain.proceed(builder.build())
+                        } else {
+                            chain.proceed(request)
+                        }
+                    }
                     .build()
             )
         )
@@ -1244,7 +1265,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
                 return@Factory dataSpec.withUri(it.first.toUri())
             }
 
-            // PRIMARY RESOLUTION: BitChord StreamResolver
+            // PRIMARY RESOLUTION: BitChord StreamResolver with live header probing
             val bitChordUrl = runCatching {
                 runBlocking(Dispatchers.IO) {
                     StreamResolver.resolve(mediaId)
