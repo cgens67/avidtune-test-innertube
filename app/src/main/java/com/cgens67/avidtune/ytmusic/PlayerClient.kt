@@ -18,10 +18,10 @@ data class PlayerClient(
     }
 
     companion object {
-        private const val MUSIC_ORIGIN = "https://music.youtube.com"
-        private const val YOUTUBE_ORIGIN = "https://www.youtube.com"
+        const val MUSIC_ORIGIN = "https://music.youtube.com"
+        const val YOUTUBE_ORIGIN = "https://www.youtube.com"
 
-        private const val WEB_USER_AGENT =
+        const val WEB_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
